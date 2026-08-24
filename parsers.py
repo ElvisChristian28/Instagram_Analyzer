@@ -242,25 +242,182 @@ def fallback_meta_scrape(page, username):
     return None
 
 
-# ──────────────── Post Metadata Extraction ─────────────────────────────
+# ──────────────── Post Metadata from API JSON ───────────────────────────
+
+def extract_metadata_from_api(media_info):
+    """
+    PRIMARY: extract all engagement data directly from the intercepted
+    xdt_shortcode_media / items[0] API response.
+    This is the most reliable source — no HTML parsing needed.
+
+    Returns a metadata dict with:
+      like_count, comment_count, view_count, save_count,
+      caption, timestamp, post_type, is_video,
+      owner_username, owner_full_name, owner_followers,
+      owner_following, owner_posts_count, owner_is_verified
+    """
+    if not media_info or not isinstance(media_info, dict):
+        return {}
+
+    metadata = {}
+
+    # ── Post identity ──
+    metadata["shortcode"] = (
+        media_info.get("shortcode") or media_info.get("code")
+    )
+    metadata["url"] = f"https://www.instagram.com/p/{metadata['shortcode']}/" if metadata["shortcode"] else None
+    metadata["post_id"] = media_info.get("id") or media_info.get("pk")
+
+    # ── Post type ──
+    is_video = media_info.get("is_video", False)
+    product_type = media_info.get("product_type", "")
+    typename = media_info.get("__typename", "")
+    media_type = media_info.get("media_type")  # REST: 1=photo, 2=video, 8=carousel
+
+    if "clips" in product_type or "reel" in product_type or typename == "XDTGraphVideo":
+        metadata["post_type"] = "reel"
+    elif media_type == 8 or "sidecar" in typename.lower() or "carousel" in product_type:
+        metadata["post_type"] = "carousel"
+    elif is_video or media_type == 2:
+        metadata["post_type"] = "video"
+    else:
+        metadata["post_type"] = "image"
+
+    metadata["is_video"] = is_video
+
+    # ── Engagement counts ──
+    # Likes
+    metadata["like_count"] = (
+        safe_get(media_info, "edge_media_preview_like", "count")
+        or safe_get(media_info, "edge_liked_by", "count")
+        or media_info.get("like_count")
+        or safe_get(media_info, "likes", "count")
+    )
+
+    # Comments
+    metadata["comment_count"] = (
+        safe_get(media_info, "edge_media_to_comment", "count")
+        or safe_get(media_info, "edge_media_to_parent_comment", "count")
+        or media_info.get("comment_count")
+        or safe_get(media_info, "comments", "count")
+    )
+
+    # Views (video/reel)
+    metadata["view_count"] = (
+        media_info.get("video_view_count")
+        or media_info.get("play_count")
+        or media_info.get("view_count")
+        or media_info.get("ig_play_count")
+    )
+
+    # Saves / bookmark count
+    metadata["save_count"] = (
+        media_info.get("saved_collection_ids_count")  # sometimes present
+        or safe_get(media_info, "edge_media_to_collection", "count")
+        or None  # saves are often hidden from API
+    )
+
+    # ── Caption ──
+    caption_raw = (
+        safe_get(media_info, "edge_media_to_caption", "edges", 0, "node", "text")
+        or safe_get(media_info, "caption", "text")
+        or (media_info.get("caption") if isinstance(media_info.get("caption"), str) else None)
+    )
+    if caption_raw:
+        try:
+            metadata["caption"] = caption_raw.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+        except Exception:
+            metadata["caption"] = str(caption_raw)
+    else:
+        metadata["caption"] = None
+
+    # ── Timestamp ──
+    ts = media_info.get("taken_at_timestamp") or media_info.get("taken_at")
+    metadata["timestamp"] = ts
+    if ts:
+        try:
+            metadata["timestamp_iso"] = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+        except Exception:
+            metadata["timestamp_iso"] = None
+    else:
+        metadata["timestamp_iso"] = None
+
+    # ── Location ──
+    loc = media_info.get("location")
+    if loc and isinstance(loc, dict):
+        metadata["location"] = loc.get("name")
+    else:
+        metadata["location"] = None
+
+    # ── Owner / Author info ──
+    owner = media_info.get("owner") or media_info.get("user") or {}
+    if isinstance(owner, dict):
+        metadata["owner_username"] = owner.get("username")
+        metadata["owner_full_name"] = owner.get("full_name")
+        metadata["owner_is_verified"] = owner.get("is_verified", False)
+        metadata["owner_profile_pic"] = owner.get("profile_pic_url")
+
+        # Follower/following counts (present when post is on owner's own page)
+        metadata["owner_followers"] = (
+            safe_get(owner, "edge_followed_by", "count")
+            or owner.get("follower_count")
+        )
+        metadata["owner_following"] = (
+            safe_get(owner, "edge_follow", "count")
+            or owner.get("following_count")
+        )
+        metadata["owner_posts_count"] = (
+            safe_get(owner, "edge_owner_to_timeline_media", "count")
+            or owner.get("media_count")
+        )
+    else:
+        metadata["owner_username"] = None
+        metadata["owner_full_name"] = None
+        metadata["owner_is_verified"] = None
+        metadata["owner_profile_pic"] = None
+        metadata["owner_followers"] = None
+        metadata["owner_following"] = None
+        metadata["owner_posts_count"] = None
+
+    # ── Tags / hashtags from caption ──
+    if metadata.get("caption"):
+        metadata["hashtags"] = re.findall(r"#(\w+)", metadata["caption"])
+        metadata["mentions"] = re.findall(r"@(\w+)", metadata["caption"])
+    else:
+        metadata["hashtags"] = []
+        metadata["mentions"] = []
+
+    return metadata
+
+
+# ──────────────── Post Metadata HTML Fallback ───────────────────────────
 
 def extract_post_metadata(page, shortcode):
     """
-    Extract engagement metadata from a post page's HTML source.
-    Returns dict with like_count, comment_count, view_count, caption,
-    timestamp, post_type, owner_username.
+    FALLBACK: extract engagement metadata from page HTML when API intercept
+    didn't fire. Tries multiple JSON patterns in the page source.
     """
     metadata = {
         "shortcode": shortcode,
         "url": f"https://www.instagram.com/p/{shortcode}/",
         "post_type": "unknown",
+        "is_video": False,
         "owner_username": None,
+        "owner_full_name": None,
+        "owner_followers": None,
+        "owner_following": None,
+        "owner_posts_count": None,
+        "owner_is_verified": None,
         "caption": None,
         "like_count": None,
         "comment_count": None,
         "view_count": None,
+        "save_count": None,
         "timestamp": None,
         "timestamp_iso": None,
+        "hashtags": [],
+        "mentions": [],
+        "location": None,
     }
 
     try:
@@ -268,7 +425,26 @@ def extract_post_metadata(page, shortcode):
     except Exception:
         return metadata
 
-    # ── Like count ──
+    # ── Try to find and parse the full media JSON blob ──
+    # Instagram embeds the full post JSON in script tags
+    for pattern in [
+        r'"xdt_shortcode_media"\s*:\s*(\{.*?\})\s*[,}]',
+        r'"shortcode_media"\s*:\s*(\{.*?\})\s*[,}]',
+        r'"items"\s*:\s*\[(\{.*?\})\]',
+    ]:
+        m = re.search(pattern, html, re.DOTALL)
+        if m:
+            try:
+                media_info = json.loads(m.group(1))
+                result = extract_metadata_from_api(media_info)
+                if result.get("like_count") is not None or result.get("owner_username"):
+                    result["shortcode"] = shortcode
+                    _report_metadata_fields(result)
+                    return result
+            except Exception:
+                pass
+
+    # ── Individual field regex fallbacks ──
     for pattern in [
         r'"edge_media_preview_like"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
         r'"like_count"\s*:\s*(\d+)',
@@ -279,7 +455,6 @@ def extract_post_metadata(page, shortcode):
             metadata["like_count"] = int(m.group(1))
             break
 
-    # ── Comment count ──
     for pattern in [
         r'"edge_media_to_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
         r'"edge_media_to_parent_comment"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
@@ -290,7 +465,6 @@ def extract_post_metadata(page, shortcode):
             metadata["comment_count"] = int(m.group(1))
             break
 
-    # ── View count (video/reel only) ──
     for pattern in [
         r'"video_view_count"\s*:\s*(\d+)',
         r'"play_count"\s*:\s*(\d+)',
@@ -301,49 +475,43 @@ def extract_post_metadata(page, shortcode):
             metadata["view_count"] = int(m.group(1))
             break
 
-    # ── Caption ──
+    # Caption
     for pattern in [
-        r'"edge_media_to_caption"\s*:\s*\{\s*"edges"\s*:\s*\[\s*\{\s*"node"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}',
+        r'"edge_media_to_caption"\s*:\s*\{\s*"edges"\s*:\s*\[\s*\{\s*"node"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
         r'"caption"\s*:\s*\{\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"',
     ]:
         m = re.search(pattern, html, re.DOTALL)
         if m:
             try:
                 raw = m.group(1)
-                # Decode JSON-style escapes (\n, \u00e9, etc.)
-                # Use json.loads with wrapping quotes to safely decode
                 decoded = json.loads(f'"{raw}"')
-                # Remove any remaining surrogate characters that can't be UTF-8 encoded
                 metadata["caption"] = decoded.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
             except Exception:
-                # Fallback: just use raw text, stripping backslash escapes
-                metadata["caption"] = raw.replace("\\n", "\n").replace("\\/", "/")
+                metadata["caption"] = m.group(1).replace("\\n", "\n").replace("\\/", "/")
+            if metadata["caption"]:
+                metadata["hashtags"] = re.findall(r"#(\w+)", metadata["caption"])
+                metadata["mentions"] = re.findall(r"@(\w+)", metadata["caption"])
             break
 
-    # ── Timestamp ──
-    for pattern in [
-        r'"taken_at_timestamp"\s*:\s*(\d+)',
-        r'"taken_at"\s*:\s*(\d+)',
-    ]:
+    # Timestamp
+    for pattern in [r'"taken_at_timestamp"\s*:\s*(\d+)', r'"taken_at"\s*:\s*(\d+)']:
         m = re.search(pattern, html)
         if m:
             ts = int(m.group(1))
             metadata["timestamp"] = ts
             try:
-                metadata["timestamp_iso"] = datetime.fromtimestamp(
-                    ts, tz=timezone.utc
-                ).isoformat()
+                metadata["timestamp_iso"] = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
             except Exception:
                 pass
             break
 
-    # ── Post type ──
+    # Post type
     is_video = bool(re.search(r'"is_video"\s*:\s*true', html, re.IGNORECASE))
-    product_type_match = re.search(r'"product_type"\s*:\s*"(\w+)"', html)
-    typename_match = re.search(r'"__typename"\s*:\s*"Graph(\w+)"', html)
-
-    if product_type_match:
-        pt = product_type_match.group(1).lower()
+    metadata["is_video"] = is_video
+    product_type_m = re.search(r'"product_type"\s*:\s*"(\w+)"', html)
+    typename_m = re.search(r'"__typename"\s*:\s*"Graph(\w+)"', html)
+    if product_type_m:
+        pt = product_type_m.group(1).lower()
         if "clips" in pt or "reel" in pt:
             metadata["post_type"] = "reel"
         elif "carousel" in pt:
@@ -352,32 +520,42 @@ def extract_post_metadata(page, shortcode):
             metadata["post_type"] = "video"
         else:
             metadata["post_type"] = "image"
-    elif typename_match:
-        tn = typename_match.group(1).lower()
+    elif typename_m:
+        tn = typename_m.group(1).lower()
         if "sidecar" in tn:
             metadata["post_type"] = "carousel"
         elif "video" in tn:
-            metadata["post_type"] = "video" if not is_video else "reel"
+            metadata["post_type"] = "reel" if is_video else "video"
         else:
             metadata["post_type"] = "image"
     elif is_video:
         metadata["post_type"] = "video"
+    elif re.search(r'"edge_sidecar_to_children"|"carousel_media"', html):
+        metadata["post_type"] = "carousel"
     else:
-        # Check for carousel (sidecar)
-        if re.search(r'"edge_sidecar_to_children"', html) or re.search(r'"carousel_media"', html):
-            metadata["post_type"] = "carousel"
-        else:
-            metadata["post_type"] = "image"
+        metadata["post_type"] = "image"
 
-    # ── Owner username ──
+    # Owner
     m = re.search(r'"owner"\s*:\s*\{[^}]*"username"\s*:\s*"([^"]+)"', html)
     if m:
         metadata["owner_username"] = m.group(1)
+    m = re.search(r'"owner"\s*:\s*\{[^}]*"full_name"\s*:\s*"([^"]*)"', html)
+    if m:
+        metadata["owner_full_name"] = m.group(1)
+    for pat in [r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"follower_count"\s*:\s*(\d+)']:
+        m = re.search(pat, html)
+        if m:
+            metadata["owner_followers"] = int(m.group(1))
+            break
+    for pat in [r'"edge_follow"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"following_count"\s*:\s*(\d+)']:
+        m = re.search(pat, html)
+        if m:
+            metadata["owner_following"] = int(m.group(1))
+            break
 
-    # ── DOM fallback for like count ──
+    # DOM fallback for likes
     if metadata["like_count"] is None:
         try:
-            # Instagram shows "Liked by X and Y others" or "N likes"
             like_section = page.locator('section:has(button[aria-label*="like" i])').first
             like_text = like_section.text_content(timeout=3000)
             if like_text:
@@ -387,16 +565,26 @@ def extract_post_metadata(page, shortcode):
         except Exception:
             pass
 
-    source = []
-    if metadata["like_count"] is not None:
-        source.append("likes")
-    if metadata["comment_count"] is not None:
-        source.append("comments")
-    if metadata["view_count"] is not None:
-        source.append("views")
-    if metadata["caption"]:
-        source.append("caption")
-    if source:
-        print(f"      📊 Metadata: {', '.join(source)}")
-
+    _report_metadata_fields(metadata)
     return metadata
+
+
+def _report_metadata_fields(metadata):
+    """Print a summary of what metadata was captured."""
+    captured = []
+    if metadata.get("like_count") is not None:
+        captured.append(f"❤️ {metadata['like_count']:,}")
+    if metadata.get("comment_count") is not None:
+        captured.append(f"💬 {metadata['comment_count']:,}")
+    if metadata.get("view_count") is not None:
+        captured.append(f"👁️ {metadata['view_count']:,}")
+    if metadata.get("save_count") is not None:
+        captured.append(f"🔖 {metadata['save_count']:,}")
+    if metadata.get("owner_username"):
+        captured.append(f"👤 @{metadata['owner_username']}")
+    if metadata.get("owner_followers") is not None:
+        captured.append(f"👥 {metadata['owner_followers']:,} followers")
+    if captured:
+        print(f"      📊 {' | '.join(captured)}")
+    else:
+        print("      📊 Metadata: (awaiting API intercept)")

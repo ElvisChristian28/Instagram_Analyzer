@@ -43,24 +43,44 @@ def save_login_session(playwright):
     print("  AUTOMATED LOGIN")
     print("=" * 60)
 
-    browser = playwright.chromium.launch(headless=False)
+    browser = playwright.chromium.launch(
+        headless=False,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+    )
     context = browser.new_context(
         viewport={"width": 1280, "height": 800},
         user_agent=USER_AGENT,
     )
     page = context.new_page()
 
-    # ── 1. Open login page ──
+    # ── 1. Open login page (with retry on network errors) ──
     print("\n📌 Opening Instagram login page...")
-    page.goto(
-        "https://www.instagram.com/accounts/login/",
-        wait_until="networkidle",
-        timeout=60000,
-    )
+    for nav_attempt in range(1, 4):
+        try:
+            page.goto(
+                "https://www.instagram.com/accounts/login/",
+                wait_until="domcontentloaded",  # less strict than networkidle
+                timeout=45000,
+            )
+            break  # success
+        except Exception as nav_err:
+            if nav_attempt < 3:
+                wait_sec = nav_attempt * 8
+                print(f"   ⚠️ Navigation error (attempt {nav_attempt}/3): {nav_err}")
+                print(f"   ⏳ Retrying in {wait_sec}s...")
+                time.sleep(wait_sec)
+            else:
+                print(f"   ❌ Could not reach Instagram after 3 attempts: {nav_err}")
+                print("   Please check your internet connection and try again.")
+                browser.close()
+                return
 
-    # Instagram's login page is JS-heavy — give it plenty of time to render
+    # Instagram's login page is JS-heavy — give it time to render
     print("   ⏳ Waiting for page to fully render...")
-    time.sleep(8)
+    time.sleep(6)
     dismiss_cookie_banner(page)
     time.sleep(2)
 
@@ -237,26 +257,71 @@ def save_login_session(playwright):
     browser.close()
 
 
-def verify_session_live(context):
+def verify_session_live(context, retries=3):
     """
     Quick check: navigate to Instagram and see if we're still logged in.
-    Returns True if logged in, False if redirected to login page.
+    Returns True  — logged in (or network error, session preserved)
+    Returns False — definitively redirected to login page (session expired)
+
+    Network errors (ERR_NETWORK_CHANGED, timeouts) are treated as
+    transient and return True to avoid wrongly deleting state.json.
     """
     page = context.new_page()
-    try:
-        page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=20000)
-        time.sleep(3)
-        dismiss_cookie_banner(page)
+    last_error = None
 
-        current_url = page.url
-        if "/accounts/login" in current_url:
-            print("⚠️  Session expired — redirected to login page.")
-            return False
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=25000,
+            )
+            time.sleep(3)
+            dismiss_cookie_banner(page)
 
-        print(f"   ✅ Session appears valid (URL: {current_url})")
-        return True
-    except Exception as e:
-        print(f"   ⚠️ Session check failed: {e}")
-        return False
-    finally:
-        page.close()
+            current_url = page.url
+
+            # Definitive session expiry — Instagram redirected to login
+            if "/accounts/login" in current_url:
+                print("⚠️  Session expired — redirected to login page.")
+                page.close()
+                return False
+
+            print(f"   ✅ Session appears valid (URL: {current_url})")
+            page.close()
+            return True
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+
+            # Transient network errors — retry
+            transient = any(x in error_str for x in [
+                "ERR_NETWORK_CHANGED",
+                "ERR_INTERNET_DISCONNECTED",
+                "ERR_CONNECTION_RESET",
+                "ERR_CONNECTION_TIMED_OUT",
+                "net::",
+                "Timeout",
+                "timeout",
+            ])
+
+            if transient and attempt < retries:
+                wait = attempt * 5
+                print(f"   ⚠️ Network error (attempt {attempt}/{retries}), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+
+            # Non-transient error or retries exhausted
+            print(f"   ⚠️ Session check failed: {e}")
+            if transient:
+                # Network is unreliable — don't delete state.json, assume logged in
+                print("   ℹ️  Network appears unstable — preserving session file.")
+                page.close()
+                return True
+            else:
+                page.close()
+                return False
+
+    page.close()
+    return True  # Exhausted retries with network errors — preserve session

@@ -1,16 +1,28 @@
 """Configuration constants for the Instagram scraper."""
 
-# ──────────────────────────── Configuration ────────────────────────────
-STORAGE_STATE_PATH = "state.json"
+# ──────────────────────────── Mode Selection ────────────────────────────
+# Set to "hashtag" to scrape by hashtag, or "profile" to scrape by username.
+SCRAPE_MODE = "hashtag"  # "hashtag" | "profile"
+#crochet#crochetersofinstagram#crochetaddict#crochetlove#crochetinspiration#crocheting#handmadecrochet#crochetcommunity#ilovecrochet#makersgonnamake
+# ── Hashtag Mode ──
+# TARGET_HASHTAGS = ["crochet", "crochetersofinstagram", "crochetaddict", "crochetlove", "crochetinspiration","crocheting","handmadecrochet","crochetcommunity","ilovecrochet","makersgonnamake"]
+
+TARGET_HASHTAGS = ["crochet", "crochetersofinstagram", "crochetaddict"]
+POSTS_PER_HASHTAG = 100         # Target number of posts to collect per hashtag
+HASHTAG_SCROLL_PAUSE_MIN = 3.0   # Seconds to wait between scroll steps
+HASHTAG_SCROLL_PAUSE_MAX = 6.0
+IMAGES_ONLY = False              # False = download images AND videos/reels
+
+# ── Profile Mode ──
 TARGET_USERNAMES = ["nasa", "natgeo"]
-HEADLESS = False
 MAX_POSTS_TO_DOWNLOAD = 3
 
-# Set True to delete state.json and force a fresh login
+# ──────────────────────────── Auth ─────────────────────────────────────
+STORAGE_STATE_PATH = "state.json"
+HEADLESS = False
 FORCE_RELOGIN = False
 
-# ── Login Credentials ──
-# The script will type these into Instagram automatically.
+# Login Credentials (used for automated login only)
 # ⚠️  CHANGE YOUR PASSWORD after state.json is created, then clear these.
 IG_USERNAME = "elcianna_6"
 IG_PASSWORD = "anncia-elvis0628"
@@ -22,23 +34,17 @@ USER_AGENT = (
 )
 
 # ──────────────────────────── Rate Limiting ─────────────────────────────
-# Instagram rate limits: ~200 requests/hour for logged-in users.
-# These settings keep you well under the limit even with many accounts.
-
-# Delay between visiting individual post pages (seconds, randomized ±30%)
 POST_DELAY_MIN = 5.0
 POST_DELAY_MAX = 10.0
 
-# Delay between scraping different profiles (seconds)
 PROFILE_DELAY_MIN = 15.0
 PROFILE_DELAY_MAX = 30.0
 
-# After every N profiles, take a long break to cool down
 COOLDOWN_EVERY_N_PROFILES = 5
-COOLDOWN_DURATION_MIN = 60.0   # 1 minute minimum
-COOLDOWN_DURATION_MAX = 120.0  # 2 minutes maximum
+COOLDOWN_DURATION_MIN = 60.0
+COOLDOWN_DURATION_MAX = 120.0
 
 # ──────────────────────────── Comments ──────────────────────────────────
-MAX_COMMENTS_PER_POST = 100     # Collect up to this many comments per post
-COMMENT_SCROLL_PAUSE = 2.0     # Seconds to wait between comment-load scrolls
-MAX_COMMENT_SCROLL_ATTEMPTS = 20  # Max scroll/click attempts to load comments
+MAX_COMMENTS_PER_POST = 150
+COMMENT_SCROLL_PAUSE = 2.5
+MAX_COMMENT_SCROLL_ATTEMPTS = 30

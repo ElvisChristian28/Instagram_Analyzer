@@ -7,29 +7,44 @@ from config import USER_AGENT
 
 
 def safe_get(d, *keys, default=None):
-    """Safely traverse nested dicts without KeyError."""
+    """Safely traverse nested dicts/lists without KeyError/IndexError."""
     current = d
     for key in keys:
-        if isinstance(current, dict):
-            current = current.get(key)
-        else:
-            return default
         if current is None:
             return default
-    return current
+        if isinstance(current, dict):
+            current = current.get(key)
+        elif isinstance(current, (list, tuple)) and isinstance(key, int):
+            try:
+                current = current[key]
+            except IndexError:
+                return default
+        else:
+            return default
+    return current if current is not None else default
 
 
-def download_file(url, filepath):
-    """Downloads a file from a URL to the local disk."""
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=30) as response:
-            with open(filepath, "wb") as out_file:
-                out_file.write(response.read())
-        return True
-    except Exception as e:
-        print(f"      ⚠️ Download failed: {e}")
-        return False
+def download_file(url, filepath, retries=3):
+    """Downloads a file from a URL to the local disk with retry on network errors."""
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                with open(filepath, "wb") as out_file:
+                    out_file.write(response.read())
+            return True
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(x in err_str for x in [
+                "10060", "10054", "timed out", "Connection reset",
+                "URLError", "RemoteDisconnected", "IncompleteRead",
+            ])
+            if is_transient and attempt < retries:
+                time.sleep(attempt * 5)
+                continue
+            print(f"      ⚠️ Download failed: {e}")
+            return False
+    return False
 
 
 def dismiss_cookie_banner(page):
@@ -112,8 +127,12 @@ def dismiss_login_popup(page):
 
 
 def parse_human_number(s):
-    """Convert '1,234' or '1.2M' or '500K' to int."""
-    s = s.strip().replace(",", "")
+    """Convert '1,234' or '1.2M' or '500K' to int. Returns 0 for None/empty."""
+    if not s and s != 0:
+        return 0
+    s = str(s).strip().replace(",", "")
+    if not s:
+        return 0
     multiplier = 1
     if s.upper().endswith("K"):
         multiplier = 1_000

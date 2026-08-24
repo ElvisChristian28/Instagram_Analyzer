@@ -12,6 +12,7 @@ from config import (
     MAX_COMMENTS_PER_POST,
     COMMENT_SCROLL_PAUSE,
     MAX_COMMENT_SCROLL_ATTEMPTS,
+    IMAGES_ONLY,
 )
 from utils import safe_get, download_file, dismiss_cookie_banner, dismiss_login_popup
 from parsers import (
@@ -19,6 +20,7 @@ from parsers import (
     extract_from_page_source,
     fallback_meta_scrape,
     extract_post_metadata,
+    extract_metadata_from_api,
 )
 
 
@@ -190,9 +192,10 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
         "media_urls": [],   # List of (url, extension) tuples
         "comments": [],     # List of comment dicts
         "metadata": {},     # Engagement metadata
+        "is_video": False,  # Set True if API confirms this is a video/reel
     }
 
-    # ── API response interception (captures media + comments in background) ──
+    # ── API response interception (captures media + metadata + comments in background) ──
     def handle_post_response(response):
         nonlocal post_data
         url = response.url
@@ -212,7 +215,7 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
 
             data = response.json()
 
-            # ── Try to extract media info ──
+            # ── Primary: extract media info from xdt_shortcode_media payload ──
             media_info = (
                 safe_get(data, "data", "xdt_shortcode_media")
                 or safe_get(data, "data", "shortcode_media")
@@ -220,13 +223,25 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
                 or safe_get(data, "items", 0)  # REST v1 format
             )
 
-            if media_info and not post_data["media_urls"]:
-                _extract_media_from_api(media_info, post_data)
+            if media_info:
+                # Set video flag
+                if media_info.get("is_video") or media_info.get("product_type") == "clips":
+                    post_data["is_video"] = True
 
-            # ── Try to extract comments ──
+                # Extract all metadata directly from API response (most reliable)
+                if not post_data.get("metadata"):
+                    api_meta = extract_metadata_from_api(media_info)
+                    if api_meta:
+                        post_data["metadata"] = api_meta
+
+                # Extract media URLs
+                if not post_data["media_urls"]:
+                    _extract_media_from_api(media_info, post_data)
+
+            # ── Try to extract comments from API ──
             _extract_comments_from_api(data, media_info, post_data)
 
-        except Exception as e:
+        except Exception:
             pass  # Silently handle API parse errors
     # ── Also intercept video CDN URLs from network traffic ──
     captured_video_urls = set()
@@ -271,14 +286,25 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
     except Exception:
         pass
 
-    # Wait for API to respond
+    # Wait for API to respond (metadata + media URLs)
     waited = 0.0
-    while not post_data["media_urls"] and waited < 8:
+    while (not post_data["media_urls"] or not post_data.get("metadata")) and waited < 10:
         time.sleep(0.5)
         waited += 0.5
 
-    # ── Extract metadata BEFORE closing page ──
-    post_data["metadata"] = extract_post_metadata(page, shortcode)
+    # ── Extract metadata: use API result if captured, else HTML fallback ──
+    if not post_data.get("metadata"):
+        post_data["metadata"] = extract_post_metadata(page, shortcode)
+    else:
+        from parsers import _report_metadata_fields
+        _report_metadata_fields(post_data["metadata"])
+
+    # ── Enrich owner profile if followers/following missing ──
+    meta = post_data.get("metadata", {})
+    owner_un = meta.get("owner_username")
+    if owner_un and meta.get("owner_followers") is None:
+        _fetch_owner_profile(meta, owner_un)
+
 
     # ── Media extraction fallbacks ──
     if not post_data["media_urls"]:
@@ -295,31 +321,79 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
                 post_data["media_urls"].append((vurl, ".mp4"))
                 print(f"      ✅ Captured video from CDN")
 
-    # ── For reels: if no video found, try /reel/ URL ──
+    # ── For reels: if no video found, try /reel/ URL with DOM video element grab ──
     has_video = any(ext == ".mp4" for _, ext in post_data["media_urls"])
-    is_reel = post_data["metadata"].get("post_type") in ("reel", "video")
+    is_reel = post_data["metadata"].get("post_type") in ("reel", "video") or post_data["is_video"]
 
     if is_reel and not has_video:
-        print("      🎬 Reel detected but no video yet — trying /reel/ URL...")
+        print("      🎬 Reel detected — attempting video download...")
         try:
             reel_url = f"https://www.instagram.com/reel/{shortcode}/"
-            page.goto(reel_url, wait_until="domcontentloaded", timeout=15000)
-            time.sleep(random.uniform(2.0, 3.0))
+            page.goto(reel_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(random.uniform(3.0, 5.0))
             dismiss_login_popup(page)
-            time.sleep(2)
+            time.sleep(3)
 
-            # Try page source on reel page
-            _extract_media_from_page_source(page, post_data)
+            # Strategy 1: Read <video> src directly from live DOM via JS
+            try:
+                video_srcs = page.evaluate("""
+                    () => {
+                        const vids = document.querySelectorAll('video');
+                        const srcs = [];
+                        vids.forEach(v => {
+                            if (v.src && v.src.startsWith('http')) srcs.push(v.src);
+                            v.querySelectorAll('source').forEach(s => {
+                                if (s.src && s.src.startsWith('http')) srcs.push(s.src);
+                            });
+                        });
+                        return [...new Set(srcs)];
+                    }
+                """)
+                for vsrc in (video_srcs or []):
+                    if vsrc and vsrc not in {u for u, _ in post_data["media_urls"]}:
+                        post_data["media_urls"].append((vsrc, ".mp4"))
+                        print(f"      ✅ Got video from DOM <video> element")
+            except Exception:
+                pass
 
-            # Check CDN captures after reel page load
+            # Strategy 2: Check CDN captures (network intercept during reel page load)
             if captured_video_urls:
                 existing_urls = {u for u, _ in post_data["media_urls"]}
                 for vurl in captured_video_urls:
                     if vurl not in existing_urls:
                         post_data["media_urls"].append((vurl, ".mp4"))
                         print(f"      ✅ Captured reel video from CDN")
+
+            # Strategy 3: Page source regex (video_url, video_versions)
+            if not any(ext == ".mp4" for _, ext in post_data["media_urls"]):
+                _extract_media_from_page_source(page, post_data)
+
+            # Strategy 4: Try window.__additionalDataLoaded via JS
+            if not any(ext == ".mp4" for _, ext in post_data["media_urls"]):
+                try:
+                    vid_url = page.evaluate("""
+                        () => {
+                            try {
+                                // Try Redux/Relay store
+                                const keys = Object.keys(window.__relay_store__ || {});
+                                for (const k of keys) {
+                                    const n = window.__relay_store__[k];
+                                    if (n && n.video_url) return n.video_url;
+                                    if (n && n.videoUrl) return n.videoUrl;
+                                }
+                            } catch(e) {}
+                            return null;
+                        }
+                    """)
+                    if vid_url:
+                        post_data["media_urls"].append((vid_url, ".mp4"))
+                        print("      ✅ Got video from JS store")
+                except Exception:
+                    pass
+
         except Exception as e:
-            print(f"      ⚠️ Reel URL failed: {e}")
+            print(f"      ⚠️ Reel video fetch failed: {e}")
+
 
     if not post_data["media_urls"]:
         _extract_media_oembed(shortcode, post_data)
@@ -330,22 +404,35 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
     page.close()
 
     # ── Download media ──
-    if post_data["media_urls"]:
-        img_count = sum(1 for _, ext in post_data["media_urls"] if ext == ".jpg")
-        vid_count = sum(1 for _, ext in post_data["media_urls"] if ext == ".mp4")
+    # In IMAGES_ONLY mode: check the API-confirmed is_video flag first,
+    # then fall back to checking if all collected URLs are .mp4
+    is_video_post = post_data["is_video"] or post_data["metadata"].get("post_type") in ("reel", "video")
+
+    if IMAGES_ONLY and is_video_post:
+        print("      🎬 Video/Reel detected — skipping media download (IMAGES_ONLY=True)")
+    elif post_data["media_urls"]:
+        # Filter out .mp4 if IMAGES_ONLY
+        urls_to_download = [
+            (url, ext) for url, ext in post_data["media_urls"]
+            if not (IMAGES_ONLY and ext == ".mp4")
+        ]
+        img_count = sum(1 for _, ext in urls_to_download if ext == ".jpg")
+        vid_count = sum(1 for _, ext in urls_to_download if ext == ".mp4")
         parts = []
         if img_count:
             parts.append(f"{img_count} image(s)")
         if vid_count:
             parts.append(f"{vid_count} video(s)")
-        print(f"      📸 Found {' + '.join(parts)}. Downloading...")
-
-        for i, (url, ext) in enumerate(post_data["media_urls"]):
-            if url:
-                filepath = os.path.join(media_dir, f"{shortcode}_{i}{ext}")
-                success = download_file(url, filepath)
-                if success:
-                    print(f"      ✅ Saved: {shortcode}_{i}{ext}")
+        if parts:
+            print(f"      📸 Found {' + '.join(parts)}. Downloading...")
+            for i, (url, ext) in enumerate(urls_to_download):
+                if url:
+                    filepath = os.path.join(media_dir, f"{shortcode}_{i}{ext}")
+                    success = download_file(url, filepath)
+                    if success:
+                        print(f"      ✅ Saved: {shortcode}_{i}{ext}")
+        else:
+            print("      ℹ️  All media skipped (IMAGES_ONLY=True, only videos found)")
     else:
         print("      ❌ No media URLs found for this post.")
 
@@ -549,6 +636,43 @@ def _extract_media_oembed(shortcode, post_data):
         pass
 
 
+def _fetch_owner_profile(meta, username):
+    """
+    Enrich metadata with owner follower/following counts by calling
+    Instagram's web_profile_info endpoint. Updates meta dict in-place.
+    """
+    try:
+        url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT,
+            "X-IG-App-ID": "936619743392459",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            user = safe_get(data, "data", "user") or {}
+            if not user:
+                return
+            meta["owner_full_name"] = user.get("full_name") or meta.get("owner_full_name")
+            meta["owner_is_verified"] = user.get("is_verified", meta.get("owner_is_verified"))
+            meta["owner_followers"] = (
+                safe_get(user, "edge_followed_by", "count")
+                or user.get("follower_count")
+            )
+            meta["owner_following"] = (
+                safe_get(user, "edge_follow", "count")
+                or user.get("following_count")
+            )
+            meta["owner_posts_count"] = (
+                safe_get(user, "edge_owner_to_timeline_media", "count")
+                or user.get("media_count")
+            )
+            if meta.get("owner_followers") is not None:
+                print(f"      👥 Owner: @{username} | {meta['owner_followers']:,} followers")
+    except Exception:
+        pass  # Non-critical — skip silently
+
+
 # ──────────────── Comment Extraction Helpers ───────────────────────────
 
 def _extract_comments_from_api(data, media_info, post_data):
@@ -629,25 +753,32 @@ def _add_comment(post_data, comment):
 
 
 def _scroll_and_collect_comments(page, post_data):
-    """Scroll down and click 'load more comments' to collect up to MAX_COMMENTS."""
+    """Scroll, click load-more, and collect up to MAX_COMMENTS_PER_POST comments."""
     if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
         return
 
-    print(f"      💬 Scrolling to load comments (target: {MAX_COMMENTS_PER_POST})...")
+    print(f"      💬 Loading comments (target: {MAX_COMMENTS_PER_POST})...")
 
-    # ── Step 1: Click "View all N comments" if present ──
+    # ── Step 1: Scroll down to the comments section ──
     try:
-        view_all_selectors = [
+        page.mouse.wheel(0, 1000)
+        time.sleep(2)
+    except Exception:
+        pass
+
+    # ── Step 2: Click “View all N comments” link if present ──
+    try:
+        for sel in [
             'a:has-text("View all")',
             'button:has-text("View all")',
             'span:has-text("View all")',
-        ]
-        for sel in view_all_selectors:
+            'a[href*="/comments/"]',
+        ]:
             try:
                 btn = page.locator(sel).first
-                if btn.is_visible(timeout=2000):
+                if btn.is_visible(timeout=1500):
                     btn.click()
-                    time.sleep(COMMENT_SCROLL_PAUSE)
+                    time.sleep(3)
                     print("      ✅ Clicked 'View all comments'")
                     break
             except Exception:
@@ -655,171 +786,178 @@ def _scroll_and_collect_comments(page, post_data):
     except Exception:
         pass
 
-    # ── Step 2: Scroll and click "Load more" / "+" buttons ──
+    # ── Step 3: Initial DOM extraction after page settles ──
+    _extract_comments_from_dom(page, post_data)
+
+    # ── Step 4: Scroll + click loop ──
     prev_count = len(post_data["comments"])
+    consecutive_no_new = 0
 
     for attempt in range(MAX_COMMENT_SCROLL_ATTEMPTS):
         if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
             break
 
-        # Try clicking "load more comments" buttons
+        # Click all visible “Load more comments” / “+” buttons
         try:
             more_selectors = [
                 'button:has-text("Load more comments")',
-                'li button[aria-label*="Load more comments"]',
+                'button[aria-label*="Load more comments"]',
+                'li button[aria-label*="Load more"]',
                 'button svg[aria-label="Load more comments"]',
-                'ul button:has(svg)',  # The "+" icon button
+                'ul li button:has(svg[aria-label])',
+                # The small "+" chevron button between comment threads
+                'button._abl-',
+                'div[role="button"]:has-text("View")',
             ]
-            clicked = False
             for sel in more_selectors:
                 try:
-                    btn = page.locator(sel).first
-                    if btn.is_visible(timeout=1000):
-                        btn.click()
-                        clicked = True
-                        break
+                    btns = page.locator(sel).all()
+                    for btn in btns[:3]:  # click up to 3 at a time
+                        if btn.is_visible(timeout=500):
+                            btn.click()
+                            time.sleep(1)
                 except Exception:
                     continue
         except Exception:
             pass
 
-        # Scroll down into comments section
-        page.mouse.wheel(0, 400)
+        # Scroll into comments area
+        page.mouse.wheel(0, 500)
         time.sleep(COMMENT_SCROLL_PAUSE)
 
-        # ── Extract comments from the visible DOM ──
+        # Extract from DOM
         _extract_comments_from_dom(page, post_data)
 
-        # Check if we got new comments
         current_count = len(post_data["comments"])
         if current_count == prev_count:
-            # No new comments loaded — try one more scroll
-            page.mouse.wheel(0, 600)
-            time.sleep(COMMENT_SCROLL_PAUSE)
+            consecutive_no_new += 1
+            # Extra scroll to try to trigger lazy load
+            page.mouse.wheel(0, 800)
+            time.sleep(COMMENT_SCROLL_PAUSE + 1)
             _extract_comments_from_dom(page, post_data)
-            if len(post_data["comments"]) == prev_count:
-                break  # No more comments to load
+            if len(post_data["comments"]) == prev_count and consecutive_no_new >= 5:
+                break  # Genuinely no more comments loading
+        else:
+            consecutive_no_new = 0
+
         prev_count = len(post_data["comments"])
+
+    if post_data["comments"]:
+        print(f"      💬 Collected {len(post_data['comments'])} comments from DOM")
 
 
 def _extract_comments_from_dom(page, post_data):
-    """Extract comments from visible DOM and page source JSON."""
+    """Extract comments from visible DOM elements and page source JSON."""
     if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
         return
 
-    # ── Strategy 1: Extract from page source JSON (most reliable) ──
+    # ── Strategy 1: Direct DOM element scraping (most reliable for live page) ──
     try:
-        html = page.content()
+        # Instagram comment structure: <ul> list where each <li> is a comment
+        # The comment author is in an <a> tag, text in a <span>
+        comment_items = page.evaluate("""
+            () => {
+                const results = [];
+                // Primary: article comment list items
+                const lists = document.querySelectorAll(
+                    'article ul li, div[role="dialog"] ul li'
+                );
+                lists.forEach(li => {
+                    try {
+                        // Username: first <a> link that’s not a post/reel/explore link
+                        const links = li.querySelectorAll('a[href]');
+                        let username = null;
+                        for (const a of links) {
+                            const href = a.getAttribute('href') || '';
+                            if (!href.includes('/p/') && !href.includes('/reel/') &&
+                                !href.includes('/explore/') && !href.includes('/accounts/') &&
+                                href.startsWith('/')) {
+                                username = href.replace(/^\//,'').replace(/\/$/,'');
+                                break;
+                            }
+                        }
+                        if (!username) return;
 
-        # Look for comment data in embedded JSON
-        # Pattern: "text":"comment text","created_at":...,"owner":{"username":"user"}
-        comment_pattern = re.compile(
-            r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,'
-            r'[^}]*?"owner"\s*:\s*\{\s*[^}]*?"username"\s*:\s*"([^"]+)"',
-            re.DOTALL,
-        )
-        # Also reverse pattern: "owner" before "text"
-        comment_pattern2 = re.compile(
-            r'"owner"\s*:\s*\{\s*[^}]*?"username"\s*:\s*"([^"]+)"[^}]*?\}\s*,'
-            r'[^}]*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,',
-            re.DOTALL,
-        )
+                        // Text: all <span> content joined, minus the username at start
+                        const spans = li.querySelectorAll('span');
+                        let text = '';
+                        spans.forEach(s => {
+                            const t = s.innerText || s.textContent || '';
+                            if (t && !t.includes(username)) text += t + ' ';
+                        });
+                        text = text.trim();
 
-        for m in comment_pattern.finditer(html):
+                        // Timestamp and likes
+                        let created_at = null;
+                        const timeEl = li.querySelector('time');
+                        if (timeEl) created_at = timeEl.getAttribute('datetime');
+
+                        let likes = 0;
+                        const likeEl = li.querySelector('[aria-label*="like"], [aria-label*="Like"]');
+                        if (likeEl) {
+                            const m = (likeEl.getAttribute('aria-label') || '').match(/(\d+)/);
+                            if (m) likes = parseInt(m[1]);
+                        }
+
+                        if (username && text && text.length > 1) {
+                            results.push({username, text, likes, created_at});
+                        }
+                    } catch(e) {}
+                });
+                return results;
+            }
+        """)
+
+        for item in (comment_items or []):
             if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
                 break
-            text_raw = m.group(1)
-            username = m.group(2)
-            try:
-                text = json.loads(f'"{text_raw}"')
-                text = text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
-            except Exception:
-                text = text_raw.replace("\\n", "\n")
-            _add_comment(post_data, {
-                "username": username,
-                "text": text,
-                "likes": 0,
-                "created_at": None,
-            })
-
-        for m in comment_pattern2.finditer(html):
-            if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
-                break
-            username = m.group(1)
-            text_raw = m.group(2)
-            try:
-                text = json.loads(f'"{text_raw}"')
-                text = text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
-            except Exception:
-                text = text_raw.replace("\\n", "\n")
-            _add_comment(post_data, {
-                "username": username,
-                "text": text,
-                "likes": 0,
-                "created_at": None,
-            })
-
-    except Exception:
-        pass
-
-    # ── Strategy 2: Extract from visible DOM elements ──
-    try:
-        # Instagram renders comments as items with a link to the user profile
-        # and text content. Try to find all comment containers.
-        comment_containers = page.locator(
-            'ul li:has(a[href*="/"]):has(span), '
-            'div[role="button"]:has(a[href*="/"]):has(span)'
-        ).all()
-
-        for item in comment_containers:
-            if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
-                break
-
-            try:
-                # Get username — it's always in a link
-                username = None
-                try:
-                    user_link = item.locator('a[href*="/"]').first
-                    href = user_link.get_attribute("href", timeout=300)
-                    if href and not any(x in href for x in ["/p/", "/reel/", "/explore/", "/accounts/"]):
-                        username = href.strip("/").split("/")[-1]
-                except Exception:
-                    pass
-
-                if not username or username in ("", "explore", "accounts"):
-                    continue
-
-                # Get the full text content and remove the username from it
-                full_text = item.text_content(timeout=500)
-                if not full_text:
-                    continue
-
-                # The comment text is everything after the username
-                text = full_text.strip()
-                if text.startswith(username):
-                    text = text[len(username):].strip()
-
-                # Remove trailing metadata (likes, time, reply)
-                text = re.sub(r'\d+[smhdw]\d*\s*(like|Reply|Translate).*$', '', text, flags=re.IGNORECASE).strip()
-                text = re.sub(r'\s*(Reply|Translate|See translation)\s*$', '', text, flags=re.IGNORECASE).strip()
-
-                if not text or len(text) < 2:
-                    continue
-
-                # Skip if it looks like a section header or the caption
-                if text.lower() in ("log in", "sign up", "follow", "more"):
-                    continue
-
+            if item.get("username") and item.get("text"):
                 _add_comment(post_data, {
-                    "username": username,
-                    "text": text,
-                    "likes": 0,
-                    "created_at": None,
+                    "username": item["username"],
+                    "text": item["text"].strip(),
+                    "likes": item.get("likes", 0),
+                    "created_at": item.get("created_at"),
                 })
-
-            except Exception:
-                continue
-
     except Exception:
         pass
+
+    # ── Strategy 2: Page source JSON regex (catches API-embedded comments) ──
+    if len(post_data["comments"]) < MAX_COMMENTS_PER_POST:
+        try:
+            html = page.content()
+            # Pattern for GraphQL edge comments: {"node":{"text":"...","owner":{"username":"..."}}}
+            for m in re.finditer(
+                r'"node"\s*:\s*\{[^{}]*?"text"\s*:\s*"((?:[^"\\]|\\.)*)"[^{}]*?'  
+                r'"owner"\s*:\s*\{[^}]*?"username"\s*:\s*"([^"]+)"',
+                html, re.DOTALL
+            ):
+                if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
+                    break
+                text_raw, username = m.group(1), m.group(2)
+                try:
+                    text = json.loads(f'"{text_raw}"')
+                    text = text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+                except Exception:
+                    text = text_raw.replace("\\n", "\n")
+                if text and username:
+                    _add_comment(post_data, {"username": username, "text": text, "likes": 0, "created_at": None})
+
+            # Also try REST v1 format: {"text":"...","user":{"username":"..."}}
+            for m in re.finditer(
+                r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"[^{}]{0,200}?'  
+                r'"user"\s*:\s*\{[^}]*?"username"\s*:\s*"([^"]+)"',
+                html, re.DOTALL
+            ):
+                if len(post_data["comments"]) >= MAX_COMMENTS_PER_POST:
+                    break
+                text_raw, username = m.group(1), m.group(2)
+                try:
+                    text = json.loads(f'"{text_raw}"')
+                    text = text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+                except Exception:
+                    text = text_raw.replace("\\n", "\n")
+                if text and username and len(text) > 1:
+                    _add_comment(post_data, {"username": username, "text": text, "likes": 0, "created_at": None})
+        except Exception:
+            pass
 
