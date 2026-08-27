@@ -305,6 +305,19 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
     if owner_un and meta.get("owner_followers") is None:
         _fetch_owner_profile(meta, owner_un)
 
+    # ── AI content filter: skip post if AI-generated ──
+    from ai_filter import is_ai_generated
+    ai_check = is_ai_generated(post_data.get("metadata", {}))
+    if ai_check["is_ai"]:
+        print(f"      🤖 SKIPPED (AI content): {ai_check['reason']}")
+        page.close()
+        return {**post_data, "_skipped_ai": True, "_ai_reason": ai_check["reason"]}
+
+    # ── EARLY FLUSH: save metadata NOW before any download/comment steps ──
+    # This ensures metadata survives even if the run is cancelled mid-post.
+    if post_data.get("metadata"):
+        _flush_metadata(post_data["metadata"], shortcode, metadata_dir)
+
 
     # ── Media extraction fallbacks ──
     if not post_data["media_urls"]:
@@ -312,6 +325,7 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
 
     if not post_data["media_urls"]:
         _extract_media_from_dom(page, post_data)
+
 
     # ── Add captured video CDN URLs ──
     if captured_video_urls:
@@ -436,11 +450,11 @@ def scrape_post_media_and_comments(context, shortcode, media_dir, comments_dir, 
     else:
         print("      ❌ No media URLs found for this post.")
 
-    # ── Save metadata ──
-    if post_data["metadata"]:
-        filepath = os.path.join(metadata_dir, f"{shortcode}_metadata.json")
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(post_data["metadata"], f, indent=4, ensure_ascii=False)
+    # ── Final metadata flush (overwrites early flush with completed state) ──
+    if post_data.get("metadata"):
+        # Stamp actual downloaded comment count into metadata
+        post_data["metadata"]["comments_collected"] = len(post_data["comments"])
+        _flush_metadata(post_data["metadata"], shortcode, metadata_dir)
 
     # ── Save comments ──
     if post_data["comments"]:
@@ -634,6 +648,22 @@ def _extract_media_oembed(shortcode, post_data):
                 print("      ✅ Got thumbnail from oEmbed/API")
     except Exception:
         pass
+
+
+def _flush_metadata(metadata: dict, shortcode: str, metadata_dir: str) -> None:
+    """
+    Write metadata dict to disk immediately (atomic write via temp file).
+    Called twice: once right after capture, once after comments are done.
+    Using a temp file prevents corrupted JSON if the process is killed mid-write.
+    """
+    try:
+        filepath = os.path.join(metadata_dir, f"{shortcode}_metadata.json")
+        tmp_path  = filepath + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, filepath)   # atomic on all OSes
+    except Exception as e:
+        print(f"      ⚠️ Metadata flush failed: {e}")
 
 
 def _fetch_owner_profile(meta, username):

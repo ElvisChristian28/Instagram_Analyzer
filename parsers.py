@@ -387,6 +387,10 @@ def extract_metadata_from_api(media_info):
         metadata["hashtags"] = []
         metadata["mentions"] = []
 
+    # ── Instagram AI-generation flags (from API payload) ──
+    metadata["is_generated_media"] = bool(media_info.get("is_generated_media"))
+    metadata["ai_agent_data"] = media_info.get("ai_agent_data")  # None if absent
+
     return metadata
 
 

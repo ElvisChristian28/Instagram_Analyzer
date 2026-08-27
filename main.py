@@ -110,23 +110,22 @@ def main():
         print(f"   📁 media/    — images{'' if IMAGES_ONLY else ' + videos/reels'}")
         print(f"   📁 metadata/ — engagement data per post")
         print(f"   📁 comments/ — top 150 comments per post")
+        print(f"   📁 reports/  — per-hashtag + combined engagement matrices")
 
-        # ── Auto-generate engagement matrix after scraping ──
-        if SCRAPE_MODE == "hashtag":
-            print("\n📊 Generating engagement matrix...")
+        # ── Combined cross-hashtag matrix (all hashtags together) ──
+        if SCRAPE_MODE == "hashtag" and len(TARGET_HASHTAGS) > 1:
+            print("\n📊 Generating COMBINED cross-hashtag engagement matrix...")
             try:
                 from engagement_matrix import build_engagement_matrix, print_summary, save_report, save_csv
-                report   = build_engagement_matrix(hashtags=TARGET_HASHTAGS)
+                report = build_engagement_matrix()   # no filter = all hashtags
                 if report["hashtags"]:
                     print_summary(report)
                     json_path = save_report(report)
                     csv_path  = save_csv(report)
-                    print(f"💾 JSON report : {json_path}")
-                    print(f"💾 CSV  report : {csv_path}")
-                else:
-                    print("   ⚠️ No metadata found for matrix generation.")
+                    print(f"💾 Combined JSON → {json_path}")
+                    print(f"💾 Combined CSV  → {csv_path}")
             except Exception as em_err:
-                print(f"   ⚠️ Engagement matrix error: {em_err}")
+                print(f"   ⚠️ Combined matrix error: {em_err}")
 
 
 # ────────────────────────── Hashtag Mode ────────────────────────────────
@@ -159,7 +158,7 @@ def _run_hashtag_mode(context, output_dir, media_dir, comments_dir, metadata_dir
         total_posts = len(shortcodes)
         print(f"\n   📥 Scraping {total_posts} posts for #{hashtag}...")
 
-        stats = {"images": 0, "videos_skipped": 0, "metadata": 0, "comments": 0}
+        stats = {"images": 0, "videos": 0, "videos_skipped": 0, "metadata": 0, "comments": 0, "ai_skipped": 0}
 
         for post_idx, sc in enumerate(shortcodes, 1):
             # Rate-limited delay
@@ -176,6 +175,11 @@ def _run_hashtag_mode(context, output_dir, media_dir, comments_dir, metadata_dir
                 context, sc, media_dir, comments_dir, metadata_dir
             )
 
+            # ── AI filter: skip entirely if flagged ──
+            if result.get("_skipped_ai"):
+                stats["ai_skipped"] += 1
+                continue
+
             # Update stats
             meta = result.get("metadata", {})
             is_vid = result.get("is_video", False) or meta.get("post_type") in ("reel", "video")
@@ -183,6 +187,7 @@ def _run_hashtag_mode(context, output_dir, media_dir, comments_dir, metadata_dir
                 stats["videos_skipped"] += 1
             else:
                 stats["images"] += sum(1 for _, ext in result.get("media_urls", []) if ext == ".jpg")
+                stats["videos"] += sum(1 for _, ext in result.get("media_urls", []) if ext == ".mp4")
             if meta:
                 stats["metadata"] += 1
             if result.get("comments"):
@@ -201,6 +206,7 @@ def _run_hashtag_mode(context, output_dir, media_dir, comments_dir, metadata_dir
             if summary_parts:
                 print(f"      📈 {' | '.join(summary_parts)}")
 
+
             # Cooldown every 50 posts
             if post_idx % 50 == 0 and post_idx < total_posts:
                 cooldown = random.uniform(COOLDOWN_DURATION_MIN, COOLDOWN_DURATION_MAX)
@@ -208,18 +214,42 @@ def _run_hashtag_mode(context, output_dir, media_dir, comments_dir, metadata_dir
                 time.sleep(cooldown)
 
         # ── Hashtag summary ──
+        genuine = total_posts - stats["ai_skipped"]
         print(f"\n   ✅ #{hashtag} complete:")
         print(f"      🖼️  Images saved:       {stats['images']}")
+        print(f"      🎬  Videos saved:       {stats['videos']}")
         if IMAGES_ONLY:
             print(f"      🎬  Videos skipped:    {stats['videos_skipped']}")
         print(f"      📊  Metadata saved:     {stats['metadata']}")
         print(f"      💬  Comment files:      {stats['comments']}")
+        print(f"      🤖  AI posts filtered:  {stats['ai_skipped']} / {total_posts} "
+              f"({stats['ai_skipped']/max(total_posts,1)*100:.0f}%) — "
+              f"{genuine} genuine posts kept")
+
+        # ── Auto engagement matrix for THIS hashtag ──
+        print(f"\n   📊 Generating engagement matrix for #{hashtag}...")
+        try:
+            from engagement_matrix import (
+                build_engagement_matrix, print_summary, save_report, save_csv
+            )
+            report = build_engagement_matrix(hashtags=[hashtag])
+            if report["hashtags"]:
+                print_summary(report)
+                json_path = save_report(report)
+                csv_path  = save_csv(report)
+                print(f"   💾 Matrix JSON → {json_path}")
+                print(f"   💾 Matrix CSV  → {csv_path}")
+            else:
+                print(f"   ⚠️  No metadata found for #{hashtag} — matrix skipped.")
+        except Exception as em_err:
+            print(f"   ⚠️  Engagement matrix error: {em_err}")
 
         # Delay before next hashtag
         if tag_idx < total_tags:
             pause = random.uniform(PROFILE_DELAY_MIN, PROFILE_DELAY_MAX)
             print(f"\n⏳ Pausing {pause:.1f}s before next hashtag...")
             time.sleep(pause)
+
 
 
 # ────────────────────────── Profile Mode ────────────────────────────────
